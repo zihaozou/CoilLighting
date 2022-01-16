@@ -1,0 +1,10 @@
+lightning_logs/version_0/events.out.tfevents.1642124165.ZihaoDesktop.507337.0
+lightning_logs/version_0/hparams.yaml
+lightning_logs/version_0/checkpoints/epoch=999-step=999.ckpt
+lightning_logs/version_1/events.out.tfevents.1642134484.ZihaoDesktop.571502.0
+lightning_logs/version_1/hparams.yaml
+lightning_logs/version_1/checkpoints/epoch=6447-step=6447.ckpt
+lightning_logs/version_2/events.out.tfevents.1642192461.ZihaoDesktop.779413.0
+lightning_logs/version_2/hparams.yaml
+lightning_logs/version_2/checkpoints/epoch=5-step=5.ckpt
+lightning_logs/
