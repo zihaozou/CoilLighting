@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import io
 import cv2
+from torch.optim.lr_scheduler import CosineAnnealingLR,ReduceLROnPlateau
+import torch.optim as optim
 class LinearBlock(nn.Module):
     def __init__(self,numInput,numOutput,batchNorm):
         super(LinearBlock,self).__init__()
@@ -33,7 +35,7 @@ class FFM(nn.Module):
         super(FFM,self).__init__()
         self.mode=mode
         self.L=L
-        stepTensor=torch.arange(end=L,start=0).repeat_interleave(4)
+        stepTensor=torch.arange(end=L,start=0).repeat_interleave(2*numInput)
         index=torch.arange(start=0,end=L*numInput*2,step=numInput*2)
         ffm=torch.empty(L*2*numInput)
         if mode=='linear':
@@ -54,9 +56,10 @@ class FFM(nn.Module):
 
 def anderson(f, x0, m=5, lam=1e-4, max_iter=50, tol=1e-2, beta = 1.0):
     """ Anderson acceleration for fixed point iteration. """
-    bsz, L = x0.shape
-    X = torch.zeros(bsz, m, L, dtype=x0.dtype, device=x0.device)
-    F = torch.zeros(bsz, m, L, dtype=x0.dtype, device=x0.device)
+    bsz = x0.shape[0]
+    numEle=int(torch.numel(x0)/bsz)
+    X = torch.zeros(bsz, m, numEle, dtype=x0.dtype, device=x0.device)
+    F = torch.zeros(bsz, m, numEle, dtype=x0.dtype, device=x0.device)
     X[:,0], F[:,0] = x0.view(bsz, -1), f(x0).view(bsz, -1)
     X[:,1], F[:,1] = F[:,0], f(F[:,0].view_as(x0)).view(bsz, -1)
     
@@ -108,62 +111,138 @@ class DEQ(nn.Module):
         self.skipStride=skipStride
         self.addz=addz
         
-    def forward(self,z,x,skip):
-        curr=self.expander(z)
-        for i,l in enumerate(self.expandLayers):
-            if i in self.skipList:
-                curr=l(torch.cat((curr,skip),dim=1))
-            else:
-                curr=l(curr)
-        for i,l in enumerate(self.decoder):
-            if i==1:
-                curr=l(curr+x)
-            elif self.addz==True and i==2:
-                curr=l(curr+z)
-            else:
+    def forward(self,z,x,skip,deq):
+        if deq:
+            curr=self.expander(z)
+            for i,l in enumerate(self.expandLayers):
+                if i in self.skipList:
+                    curr=l(torch.cat((curr,skip),dim=1))
+                else:
+                    curr=l(curr)
+            for i,l in enumerate(self.decoder):
+                if i==1:
+                    curr=l(curr+x)
+                elif self.addz==True and i==2:
+                    curr=l(curr+z)
+                else:
+                    curr=l(curr)
+        else:
+            curr=self.expander(x)
+            for i,l in enumerate(self.expandLayers):
+                if i in self.skipList:
+                    curr=l(torch.cat((curr,skip),dim=1))
+                else:
+                    curr=l(curr)
+            for l in self.decoder:
                 curr=l(curr)
         return curr
 
 class DEQFixedPoint(nn.Module):
-    def __init__(self, f, solver, **kwargs):
+    def __init__(self, f, solver,**kwargs):
         super(DEQFixedPoint,self).__init__()
         self.f = f
         self.solver = solver
         self.kwargs = kwargs
-    def forward(self, x,skip):
+    def forward(self, x,skip,deq):
         # compute forward pass and re-engage autograd tape
-        with torch.no_grad():
-            z, self.forward_res = self.solver(lambda z : self.f(z, x,skip), torch.zeros_like(x), **self.kwargs)
-        newz = self.f(z.requires_grad_(),x,skip)
-        
-        def backward_hook(grad):
-            if self.hook is not None:
-                self.hook.remove()
-                torch.cuda.synchronize()
-            g, self.backward_res = self.solver(lambda y : autograd.grad(newz, z, y, retain_graph=True)[0] + grad,
-                                               grad, **self.kwargs)
-            return g
-                
-        self.hook=newz.register_hook(backward_hook)
+        if deq:
+            with torch.no_grad():
+                z, self.forward_res = self.solver(lambda z : self.f(z, x,skip,deq), torch.zeros_like(x), **self.kwargs)
+            newz = self.f(z.requires_grad_(),x,skip,deq)
+            if self.training:
+                def backward_hook(grad):
+                    if self.hook is not None:
+                        self.hook.remove()
+                        torch.cuda.synchronize()
+                    g, self.backward_res = self.solver(lambda y : autograd.grad(newz, z, y, retain_graph=True)[0] + grad,
+                                                    grad, **self.kwargs)
+                    return g
+                self.hook=newz.register_hook(backward_hook)
+        else:
+            newz=self.f(None, x,skip,deq)
         return newz
+    
 
-class CoilwithDEQ(pl.LightningModule):
+
+
+
+class CoilwithDEQBase(pl.LightningModule):
     def __init__(self,
-                lr,
-                batch_size,
+                lr=.1,
+                batch_size=65251,
+                L=10,
+                numInput=2,
+                showEvery=20
+                ):
+        super().__init__()
+        self.ffm=FFM('loglinear',L,numInput)
+        self.mse=nn.MSELoss()
+        self.batch_size=batch_size
+        self.lr=lr
+        self.showEvery=showEvery
+        self.epoch=0
+        self.DEQFixPointLayers=None
+        self.deq=True
+        plt.ioff()
+    
+
+    def training_step(self, batch, batch_idx):
+        X,y=batch
+        pred=self(X)
+        loss=self.mse(pred,y)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
+    def getBackwardResPlot(self,dpi=75):
+        fig, axs = plt.subplots(len(self.DEQFixPointLayers), 1,figsize=(10, 6), dpi=dpi)
+        if len(self.DEQFixPointLayers)==1:
+            m=min(self.DEQFixPointLayers[0].backward_res)
+            axs.annotate(str(m),(self.DEQFixPointLayers[0].backward_res.index(m),m))
+            axs.plot(self.DEQFixPointLayers[0].backward_res)
+            
+        else:
+            for ax,layer in zip(axs,self.DEQFixPointLayers):
+                m=min(layer.backward_res)
+                axs.annotate(str(m),(layer.backward_res.index(m),m))
+                ax.plot(layer.backward_res)
+                
+        fig.canvas.draw()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi)
+        plt.close(fig)
+        buf.seek(0)
+        img_arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+        buf.close()
+        img = cv2.imdecode(img_arr, 1)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return np.transpose(img,(2,0,1))
+    def on_epoch_end(self) -> None:
+        self.epoch+=1
+        if self.epoch%self.showEvery==0 and self.deq==True:
+            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.epoch)
+    def train_dataloader(self):
+        trainLoader=DataLoader(DEQDataset(),num_workers=3,pin_memory=True,batch_size=self.batch_size,shuffle=True)
+        return trainLoader
+
+
+
+
+
+class CoilwithDEQ(CoilwithDEQBase):
+    def __init__(self,
                 xEncoderLst=[],
                 numDEQ=1,
                 numEncodeNeurons=128,
                 numDEQNeurons=256,
                 addz=True,
                 norm=True,
-                L=10,
-                numInput=2,
                 numExpandLayer=3,
-                skipStride=2):
-        super().__init__()
-        self.xEncoder=[FFM('loglinear',L,numInput)]
+                skipStride=2,
+                **kwargs):
+        super().__init__(**kwargs)
+        numInput=kwargs['numInput']
+        L=kwargs['L']
         lastNumOutput=numInput*L*2
+        self.xEncoder=[]
         for l in xEncoderLst:
             if l=='fc':
                 self.xEncoder.append(LinearBlock(lastNumOutput,numEncodeNeurons,norm))
@@ -174,79 +253,45 @@ class CoilwithDEQ(pl.LightningModule):
         self.xEncoderLst=xEncoderLst
         self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numInput*L*2,
                                                 numInput= lastNumOutput,
-                                                numEncodeNeurons= numDEQNeurons,
-                                                numExpandLayers= numExpandLayer,
-                                                skipStride= skipStride,
-                                                addz=addz,
-                                                norm= norm),anderson,tol=1e-4, max_iter=50, m=5) for _ in range(numDEQ)]
+                                                numEncodeNeurons= numDEQNeurons[i] if isinstance(numDEQNeurons,list) else numDEQNeurons,
+                                                numExpandLayers= numExpandLayer[i] if isinstance(numExpandLayer,list) else numExpandLayer,
+                                                skipStride= skipStride[i] if isinstance(skipStride,list) else skipStride,
+                                                addz=addz[i] if isinstance(addz,list) else addz,
+                                                norm= norm[i] if isinstance(norm,list) else norm),
+                                            anderson,
+                                            tol=1e-4, 
+                                            max_iter=50, 
+                                            m=5) for i in range(numDEQ)]
         self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
-        self.decoder=nn.Sequential(LinearBlock(lastNumOutput*numDEQ,lastNumOutput*numDEQ,norm),
-                                    LinearBlock(lastNumOutput*numDEQ,numEncodeNeurons,norm),
-                                    nn.Linear(numEncodeNeurons,1))
-        self.mse=nn.MSELoss()
-        self.batch_size=batch_size
-        self.lr=lr
-        self.epoch=0
-        plt.ioff()
+        self.decoder=nn.Sequential(LinearBlock(lastNumOutput*numDEQ,lastNumOutput*numDEQ//2,norm),
+                                    LinearBlock(lastNumOutput*numDEQ//2,numEncodeNeurons//2**2,norm),
+                                    nn.Linear(numEncodeNeurons//2**2,1))
     def forward(self,x):
-        curr=self.xEncoder[0](x)
+        curr=self.ffm(x)
         skip=curr.clone().detach()
-        for layerName,layer in zip(self.xEncoderLst,self.xEncoder[1:]):
+        for layerName,layer in zip(self.xEncoderLst,self.xEncoder):
             if layerName=='fc':
                 curr=layer(curr)
             elif layerName=='skip':
                 curr=layer(torch.cat((curr,skip),dim=1))
-        DEQResult=[deq(curr,skip) for deq in self.DEQFixPointLayers]
+        DEQResult=[deq(curr,skip,self.deq) for deq in self.DEQFixPointLayers]
         curr=torch.cat(DEQResult,dim=1)
         return self.decoder(curr)
-    
 
-    def training_step(self, batch, batch_idx):
-        X,y=batch
-        pred=self(X)
-        loss=self.mse(pred,y)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        
-        return loss
-    def get_img_from_fig(self,fig, dpi=75):
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=dpi)
-        buf.seek(0)
-        img_arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
-        buf.close()
-        img = cv2.imdecode(img_arr, 1)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        return img
-    def on_epoch_end(self) -> None:
-        self.epoch+=1
-        if self.epoch%20==0:
-            fig, axs = plt.subplots(len(self.DEQFixPointLayers), 1,figsize=(10, 6), dpi=75)
-            if len(self.DEQFixPointLayers)==1:
-                axs.plot(self.DEQFixPointLayers[0].backward_res)
-            else:
-                for ax,layer in zip(axs,self.DEQFixPointLayers):
-                    ax.plot(layer.backward_res)
-            fig.canvas.draw()
-            img=self.get_img_from_fig(fig)
-            self.logger.experiment.add_image("residual", np.transpose(img,(2,0,1)), self.epoch)
-            plt.close(fig)
-
-        
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer=optim.AdamW(self.parameters(), lr=self.lr)
         return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
-                    "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',factor=0.5,patience=10,cooldown=3,min_lr=1e-6,verbose=True),
+                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=2000,eta_min=1e-6),
                     "monitor": "train_loss",
-                    "frequency": 2,
+                    "frequency": 1,
                     "interval": "epoch"
                     }
                 }
-    def train_dataloader(self):
-        trainLoader=DataLoader(DEQDataset(),num_workers=3,pin_memory=True,batch_size=self.batch_size,shuffle=True)
-        return trainLoader
+
+
+
 
 class DEQDataset(Dataset):
     def __init__(self) -> None:

@@ -8,3 +8,6 @@ lightning_logs/version_2/events.out.tfevents.1642192461.ZihaoDesktop.779413.0
 lightning_logs/version_2/hparams.yaml
 lightning_logs/version_2/checkpoints/epoch=5-step=5.ckpt
 lightning_logs/
+Dry_Bean_Dataset.xlsx
+bank-full.csv
+bank-additional-full.csv
