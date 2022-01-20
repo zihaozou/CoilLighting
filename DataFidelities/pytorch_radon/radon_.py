@@ -4,8 +4,6 @@ import torch.nn.functional as F
 import time
 from .utils import PI, SQRT2, deg2rad, affine_grid, grid_sample
 from .filters import RampFilter
-import torchsnooper
-
 
 class Radon(nn.Module):
     def __init__(self, in_size=None, theta=None, circle=True, dtype=torch.float, device=torch.device('cuda')):

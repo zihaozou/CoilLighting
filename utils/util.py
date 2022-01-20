@@ -37,7 +37,7 @@ def np2torch_complex(array: np.ndarray):
     return torch.stack([torch.from_numpy(array.real), torch.from_numpy(array.imag)], -1)
 
 
-def addwgn_torch(x: torch.Tensor, inputSnr):
+def addwgn_torch(x: torch.Tensor, inputSnr,minV,maxV):
     noiseNorm = torch.norm(x.flatten() * 10 ** (-inputSnr / 20))
 
     # xBool = np.isreal(x)
@@ -56,7 +56,7 @@ def addwgn_torch(x: torch.Tensor, inputSnr):
     
     rec_y = x + noise
 
-    return rec_y
+    return torch.clamp(rec_y,min=minV,max=maxV)
 
 def compare_snr(img_test, img_true):
     return 20 * torch.log10(torch.norm(img_true.flatten()) / torch.norm(img_true.flatten() - img_test.flatten()))

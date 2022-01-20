@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from .utils import PI, SQRT2, deg2rad, affine_grid, grid_sample
 from .filters import RampFilter
 #import torchsnooper
-
+from math import sqrt
 
 class Radon(nn.Module):
     def __init__(self, in_size=None, theta=None, circle=True):
@@ -16,7 +16,7 @@ class Radon(nn.Module):
             self.theta = torch.arange(180)
         self.all_grids = None
 
-
+        self.in_size=in_size
         if in_size is not None:
             self.all_grids = self._create_grids(self.theta, in_size, circle)
 
@@ -42,7 +42,7 @@ class Radon(nn.Module):
         grid = self.all_grids.to(x.device).view(L * W, W, 2).expand(N, -1, -1, -1)
         x_sampled = F.grid_sample(x, grid, align_corners=True)
         out = x_sampled.view(N, C, L, W, W).sum(dim=3).transpose(-1, -2)
-        return torch.clamp(out,min=0)
+        return torch.clamp(out,min=0,max=sqrt(2*self.in_size**2))
 
     def _create_grids(self, angles, grid_size, circle):
         if not circle:

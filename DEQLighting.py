@@ -13,13 +13,19 @@ import io
 import cv2
 from torch.optim.lr_scheduler import CosineAnnealingLR,ReduceLROnPlateau
 import torch.optim as optim
+import json
 class LinearBlock(nn.Module):
-    def __init__(self,numInput,numOutput,batchNorm):
+    def __init__(self,numInput,numOutput,batchNorm,acti):
         super(LinearBlock,self).__init__()
+        actiDict={
+                'relu':nn.LeakyReLU,
+                'sigmoid':nn.Sigmoid,
+                'tanh':nn.Tanh
+                }
         modules=[nn.Linear(numInput,numOutput)]
         if batchNorm==True:
             modules.append(nn.BatchNorm1d(numOutput))
-        modules.append(nn.LeakyReLU())
+        modules.append(actiDict[acti]())
         self.block=nn.Sequential(*modules)
         self.block.apply(self.init_weights)
     def forward(self,x):
@@ -31,7 +37,7 @@ class LinearBlock(nn.Module):
             m.bias.data.fill_(1)
 
 class FFM(nn.Module):
-    def __init__(self,mode,L,numInput,dtype=torch.cuda.FloatTensor):
+    def __init__(self,mode,L,numInput):
         super(FFM,self).__init__()
         self.mode=mode
         self.L=L
@@ -91,7 +97,9 @@ class DEQ(nn.Module):
                 numExpandLayers=5,
                 skipStride=2,
                 addz=False,
-                norm=False):
+                norm=False,
+                acti='relu',
+                lastActi='sigmoid'):
         super(DEQ,self).__init__()
         self.expander=LinearBlock(numInput,numEncodeNeurons,norm)
         if skipStride>=numExpandLayers:
@@ -100,14 +108,15 @@ class DEQ(nn.Module):
         expandLst=[]
         for i in range(numExpandLayers):
             if i in self.skipList:
-                expandLst.append(LinearBlock(numEncodeNeurons+numskipInput,numEncodeNeurons,norm))
+                expandLst.append(LinearBlock(numEncodeNeurons+numskipInput,numEncodeNeurons,norm,acti))
             else:
-                expandLst.append(LinearBlock(numEncodeNeurons,numEncodeNeurons,norm))
+                expandLst.append(LinearBlock(numEncodeNeurons,numEncodeNeurons,norm,acti))
         self.expandLayers=nn.ModuleList(expandLst)
-        self.decoder=nn.ModuleList([LinearBlock(numEncodeNeurons,numInput,norm),
-                                    LinearBlock(numInput,numInput,norm),
-                                    LinearBlock(numInput,numInput,norm)]
-                                    )
+        self.decoder=[LinearBlock(numEncodeNeurons,numInput,norm,acti)]
+        if addz:
+            self.decoder.append(LinearBlock(numInput,numInput,norm,acti))
+        self.decoder.append(LinearBlock(numInput,numInput,norm,lastActi))
+        self.decoder=nn.ModuleList(self.decoder)
         self.skipStride=skipStride
         self.addz=addz
         
@@ -169,17 +178,18 @@ class DEQFixedPoint(nn.Module):
 class CoilwithDEQBase(pl.LightningModule):
     def __init__(self,
                 lr=.1,
-                batch_size=65251,
+                batch_size=65250,
                 L=10,
                 numInput=2,
-                showEvery=20
+                showEvery=20,
+                XPath='X_new.csv',
+                yPath='y_new.csv',
+                **kwargs
                 ):
         super().__init__()
+        self.save_hyperparameters()
         self.ffm=FFM('loglinear',L,numInput)
         self.mse=nn.MSELoss()
-        self.batch_size=batch_size
-        self.lr=lr
-        self.showEvery=showEvery
         self.epoch=0
         self.DEQFixPointLayers=None
         self.deq=True
@@ -217,10 +227,12 @@ class CoilwithDEQBase(pl.LightningModule):
         return np.transpose(img,(2,0,1))
     def on_epoch_end(self) -> None:
         self.epoch+=1
-        if self.epoch%self.showEvery==0 and self.deq==True:
+        if self.epoch%self.hparams['showEvery']==0 and self.deq==True:
             self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.epoch)
     def train_dataloader(self):
-        trainLoader=DataLoader(DEQDataset(),num_workers=3,pin_memory=True,batch_size=self.batch_size,shuffle=True)
+        trainLoader=DataLoader(DEQDataset(self.hparams['XPath'],
+                                        self.hparams['yPath'],self.hparams['index_col'] if 'index_col' in self.hparams.keys() else None),
+                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=True)
         return trainLoader
 
 
@@ -229,47 +241,54 @@ class CoilwithDEQBase(pl.LightningModule):
 
 class CoilwithDEQ(CoilwithDEQBase):
     def __init__(self,
-                xEncoderLst=[],
-                numDEQ=1,
-                numEncodeNeurons=128,
-                numDEQNeurons=256,
-                addz=True,
-                norm=True,
-                numExpandLayer=3,
-                skipStride=2,
+                modelStruct:dict,
                 **kwargs):
         super().__init__(**kwargs)
-        numInput=kwargs['numInput']
-        L=kwargs['L']
-        lastNumOutput=numInput*L*2
+        print (json.dumps(modelStruct, indent=2, default=str))
+        numLastOutput=numSkipInput=self.hparams['numInput']*2*self.hparams['L']
         self.xEncoder=[]
-        for l in xEncoderLst:
-            if l=='fc':
-                self.xEncoder.append(LinearBlock(lastNumOutput,numEncodeNeurons,norm))
-            elif l=='skip':
-                self.xEncoder.append(LinearBlock(lastNumOutput+numInput*L*2,numEncodeNeurons,norm))
-            lastNumOutput=numEncodeNeurons
+        self.xEncoderList=[]
+        for l in modelStruct['encoder']:
+            self.xEncoderList.append(l['type'])
+            if l['type']=='fc':
+                self.xEncoder.append(LinearBlock(numInput=numLastOutput,numOutput=l['numNeurons'],
+                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                    acti=l['acti']
+                                    ))
+            else:
+                self.xEncoder.append(LinearBlock(numInput=numLastOutput+numSkipInput,numOutput=l['numNeurons'],
+                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                    acti=l['acti']
+                                    ))
+            numLastOutput=l['numNeurons']
         self.xEncoder=nn.ModuleList(self.xEncoder)
-        self.xEncoderLst=xEncoderLst
-        self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numInput*L*2,
-                                                numInput= lastNumOutput,
-                                                numEncodeNeurons= numDEQNeurons[i] if isinstance(numDEQNeurons,list) else numDEQNeurons,
-                                                numExpandLayers= numExpandLayer[i] if isinstance(numExpandLayer,list) else numExpandLayer,
-                                                skipStride= skipStride[i] if isinstance(skipStride,list) else skipStride,
-                                                addz=addz[i] if isinstance(addz,list) else addz,
-                                                norm= norm[i] if isinstance(norm,list) else norm),
+        self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numSkipInput,
+                                                numInput= numLastOutput,
+                                                numEncodeNeurons= l['numNeurons'],
+                                                numExpandLayers= l['numLayers'],
+                                                skipStride= l['skipStride'],
+                                                addz=l['addz'],
+                                                norm= self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                                acti=l['acti'],
+                                                lastActi=l['lastActi']),
                                             anderson,
                                             tol=1e-4, 
                                             max_iter=50, 
-                                            m=5) for i in range(numDEQ)]
+                                            m=5) for l in modelStruct['DEQ']]
         self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
-        self.decoder=nn.Sequential(LinearBlock(lastNumOutput*numDEQ,lastNumOutput*numDEQ//2,norm),
-                                    LinearBlock(lastNumOutput*numDEQ//2,numEncodeNeurons//2**2,norm),
-                                    nn.Linear(numEncodeNeurons//2**2,1))
+        numLastOutput=numLastOutput*len(modelStruct['DEQ'])
+        self.decoder=[LinearBlock(numLastOutput,numLastOutput//2,
+                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
+                                    LinearBlock(numLastOutput//2,numLastOutput//2**2,
+                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
+                                    nn.Linear(numLastOutput//2**2,1)]
+        if modelStruct['decoder']['sigmoid']:
+            self.decoder.append(nn.Sigmoid())
+        self.decoder=nn.Sequential(*self.decoder)
     def forward(self,x):
         curr=self.ffm(x)
         skip=curr.clone().detach()
-        for layerName,layer in zip(self.xEncoderLst,self.xEncoder):
+        for layerName,layer in zip(self.xEncoderList,self.xEncoder):
             if layerName=='fc':
                 curr=layer(curr)
             elif layerName=='skip':
@@ -283,7 +302,7 @@ class CoilwithDEQ(CoilwithDEQBase):
         return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
-                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=2000,eta_min=1e-6),
+                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=100,eta_min=1e-6),
                     "monitor": "train_loss",
                     "frequency": 1,
                     "interval": "epoch"
@@ -294,10 +313,12 @@ class CoilwithDEQ(CoilwithDEQBase):
 
 
 class DEQDataset(Dataset):
-    def __init__(self) -> None:
+    def __init__(self,XPath,yPath,index_col=None) -> None:
         super().__init__()
-        self.X=pd.read_csv('X.csv',header=None)
-        self.y=pd.read_csv('y.csv',header=None)
+        print(XPath)
+        print(yPath)
+        self.X=pd.read_csv(XPath,index_col=index_col)
+        self.y=pd.read_csv(yPath,index_col=index_col)
     def __len__(self) -> int:
         return len(self.X)
 
