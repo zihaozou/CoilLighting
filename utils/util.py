@@ -56,7 +56,7 @@ def addwgn_torch(x: torch.Tensor, inputSnr,minV,maxV):
     
     rec_y = x + noise
 
-    return torch.clamp(rec_y,min=minV,max=maxV)
+    return rec_y,torch.clamp(rec_y,min=minV,max=maxV)
 
 def compare_snr(img_test, img_true):
     return 20 * torch.log10(torch.norm(img_true.flatten()) / torch.norm(img_true.flatten() - img_test.flatten()))

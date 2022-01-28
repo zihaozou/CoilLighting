@@ -14,6 +14,11 @@ import cv2
 from torch.optim.lr_scheduler import CosineAnnealingLR,ReduceLROnPlateau
 import torch.optim as optim
 import json
+from DataFidelities.pytorch_radon.radon import Radon,IRadon
+from DataFidelities.pytorch_radon.filters import HannFilter
+from math import sqrt
+
+
 class LinearBlock(nn.Module):
     def __init__(self,numInput,numOutput,batchNorm,acti):
         super(LinearBlock,self).__init__()
@@ -91,59 +96,53 @@ def anderson(f, x0, m=5, lam=1e-4, max_iter=50, tol=1e-2, beta = 1.0):
 
 class DEQ(nn.Module):
     def __init__(self,
+                addx,
                 numskipInput,
                 numInput=40,
                 numEncodeNeurons=256,
                 numExpandLayers=5,
                 skipStride=2,
-                addz=False,
                 norm=False,
                 acti='relu',
                 lastActi='sigmoid'):
         super(DEQ,self).__init__()
-        self.expander=LinearBlock(numInput,numEncodeNeurons,norm)
+        currNumInput=numInput
+        currNumOutput=numEncodeNeurons
         if skipStride>=numExpandLayers:
             raise ValueError('skipStride should be smaller than numExpandlayers')
-        self.skipList=list(range(skipStride,numExpandLayers,skipStride+1))
+        self.skipList=list(range(0,numExpandLayers,skipStride+1))
         expandLst=[]
         for i in range(numExpandLayers):
+            if i+1==addx or i==numExpandLayers-1:
+                currNumOutput=numInput
             if i in self.skipList:
-                expandLst.append(LinearBlock(numEncodeNeurons+numskipInput,numEncodeNeurons,norm,acti))
+                expandLst.append(LinearBlock(currNumInput+numskipInput,currNumOutput,norm,acti))
+            elif i==numExpandLayers-1:
+                expandLst.append(LinearBlock(currNumInput,currNumOutput,norm,lastActi))
             else:
-                expandLst.append(LinearBlock(numEncodeNeurons,numEncodeNeurons,norm,acti))
+                expandLst.append(LinearBlock(currNumInput,currNumOutput,norm,acti))
+            currNumInput=currNumOutput
+            currNumOutput=numEncodeNeurons
         self.expandLayers=nn.ModuleList(expandLst)
-        self.decoder=[LinearBlock(numEncodeNeurons,numInput,norm,acti)]
-        if addz:
-            self.decoder.append(LinearBlock(numInput,numInput,norm,acti))
-        self.decoder.append(LinearBlock(numInput,numInput,norm,lastActi))
-        self.decoder=nn.ModuleList(self.decoder)
         self.skipStride=skipStride
-        self.addz=addz
-        
+        self.addx=addx
     def forward(self,z,x,skip,deq):
         if deq:
-            curr=self.expander(z)
+            curr=z
             for i,l in enumerate(self.expandLayers):
+                if i==self.addx:
+                    curr=curr+x
                 if i in self.skipList:
                     curr=l(torch.cat((curr,skip),dim=1))
-                else:
-                    curr=l(curr)
-            for i,l in enumerate(self.decoder):
-                if i==1:
-                    curr=l(curr+x)
-                elif self.addz==True and i==2:
-                    curr=l(curr+z)
                 else:
                     curr=l(curr)
         else:
-            curr=self.expander(x)
+            curr=x
             for i,l in enumerate(self.expandLayers):
                 if i in self.skipList:
                     curr=l(torch.cat((curr,skip),dim=1))
                 else:
                     curr=l(curr)
-            for l in self.decoder:
-                curr=l(curr)
         return curr
 
 class DEQFixedPoint(nn.Module):
@@ -182,17 +181,27 @@ class CoilwithDEQBase(pl.LightningModule):
                 L=10,
                 numInput=2,
                 showEvery=20,
-                XPath='X_new.csv',
-                yPath='y_new.csv',
+                XPath='data/X.csv',
+                yPath='data/y.csv',
+                originImagePath='data/image.csv',
+                fullXPath='data/fullX.csv',
+                fullyPath='data/fully.csv',
+                originFullyPath='data/originFullyy.csv',
+                normalized=False,
+                tmax=1000,
                 **kwargs
                 ):
         super().__init__()
         self.save_hyperparameters()
         self.ffm=FFM('loglinear',L,numInput)
         self.mse=nn.MSELoss()
-        self.epoch=0
         self.DEQFixPointLayers=None
         self.deq=True
+        self.valy=torch.from_numpy(pd.read_csv(fullyPath,index_col=0)['0'].to_numpy()).float().unsqueeze(1)
+        self.originy=torch.from_numpy(pd.read_csv(originFullyPath,index_col=0)['0'].to_numpy()).float().unsqueeze(1)
+        theta = torch.tensor(np.linspace(0., 180, 360, endpoint=False),dtype=torch.float)
+        self.fp=IRadon(512,theta,circle=False,use_filter=HannFilter(),device='cpu')
+        self.originImage=torch.from_numpy(pd.read_csv(originImagePath,index_col=0).to_numpy()).float().squeeze()
         plt.ioff()
     
 
@@ -225,17 +234,39 @@ class CoilwithDEQBase(pl.LightningModule):
         img = cv2.imdecode(img_arr, 1)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return np.transpose(img,(2,0,1))
-    def on_epoch_end(self) -> None:
-        self.epoch+=1
-        if self.epoch%self.hparams['showEvery']==0 and self.deq==True:
-            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.epoch)
+    def training_epoch_end(self, outputs) -> None:
+        if self.current_epoch%self.hparams['showEvery']==0 and self.deq==True:
+            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.current_epoch)
+    def validation_step(self,batch,batch_idx):
+        X,_=batch
+        pred=self(X)
+        return pred.detach().clone().cpu()
+    def validation_epoch_end(self,validation_step_outputs):
+        #print(f'Validating...\nSize of noisy y label:{self.valy.shape}\nSize of origin y label:{self.originy.shape}\nSize of origin image tensor:{self.originImage.shape}')
+        valSino=torch.cat(validation_step_outputs,dim=0)
+        if self.hparams['normalized']:
+            valSino=valSino*sqrt(2*512**2)
+        #print(f'Size of output sinogram:{valSino.shape}')
+        snr=self.compare_snr(valSino,self.valy)
+        self.logger.experiment.add_scalar('noisy snr',snr,self.current_epoch)
+        originSNR=self.compare_snr(valSino,self.originy)
+        self.logger.experiment.add_scalar('origin snr',originSNR,self.current_epoch)
+        reconImage=self.fp(valSino.reshape((1,1,-1,360))).detach().squeeze()
+        #print(f'Size of recon image:{reconImage.shape}')
+        imageSNR=self.compare_snr(reconImage,self.originImage)
+        self.logger.experiment.add_scalar('Imagesnr',imageSNR,self.current_epoch)
+        self.logger.experiment.add_images('image',torch.cat((reconImage.unsqueeze(0),self.originImage.unsqueeze(0)),dim=0).unsqueeze(1).expand(-1,3,-1,-1),self.current_epoch)
     def train_dataloader(self):
-        trainLoader=DataLoader(DEQDataset(self.hparams['XPath'],
-                                        self.hparams['yPath'],self.hparams['index_col'] if 'index_col' in self.hparams.keys() else None),
+        trainLoader=DataLoader(DEQDataset(self.hparams['XPath'],self.hparams['yPath']),
                                 num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=True)
         return trainLoader
-
-
+    def val_dataloader(self):
+        valLoader=DataLoader(DEQDataset(self.hparams['fullXPath'],self.hparams['fullyPath']),
+                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=False)
+        return valLoader
+    def compare_snr(self,img_test, img_true):
+        return 20 * torch.log10(torch.norm(img_true.flatten()) / torch.norm(img_true.flatten() - img_test.flatten()))
+        
 
 
 
@@ -262,21 +293,22 @@ class CoilwithDEQ(CoilwithDEQBase):
                                     ))
             numLastOutput=l['numNeurons']
         self.xEncoder=nn.ModuleList(self.xEncoder)
-        self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numSkipInput,
-                                                numInput= numLastOutput,
-                                                numEncodeNeurons= l['numNeurons'],
-                                                numExpandLayers= l['numLayers'],
-                                                skipStride= l['skipStride'],
-                                                addz=l['addz'],
-                                                norm= self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
-                                                acti=l['acti'],
-                                                lastActi=l['lastActi']),
-                                            anderson,
-                                            tol=1e-4, 
-                                            max_iter=50, 
-                                            m=5) for l in modelStruct['DEQ']]
-        self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
-        numLastOutput=numLastOutput*len(modelStruct['DEQ'])
+        if 'DEQ' in modelStruct.keys():
+            self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numSkipInput,
+                                                    numInput= numLastOutput,
+                                                    numEncodeNeurons= l['numNeurons'],
+                                                    numExpandLayers= l['numLayers'],
+                                                    skipStride= l['skipStride'],
+                                                    addz=l['addz'],
+                                                    norm= self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                                    acti=l['acti'],
+                                                    lastActi=l['lastActi']),
+                                                anderson,
+                                                tol=1e-4, 
+                                                max_iter=50, 
+                                                m=5) for l in modelStruct['DEQ']]
+            self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
+            numLastOutput=numLastOutput*len(modelStruct['DEQ'])
         self.decoder=[LinearBlock(numLastOutput,numLastOutput//2,
                                     self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
                                     LinearBlock(numLastOutput//2,numLastOutput//2**2,
@@ -293,16 +325,17 @@ class CoilwithDEQ(CoilwithDEQBase):
                 curr=layer(curr)
             elif layerName=='skip':
                 curr=layer(torch.cat((curr,skip),dim=1))
-        DEQResult=[deq(curr,skip,self.deq) for deq in self.DEQFixPointLayers]
-        curr=torch.cat(DEQResult,dim=1)
+        if self.DEQFixPointLayers is not None:
+            DEQResult=[deq(curr,skip,self.deq) for deq in self.DEQFixPointLayers]
+            curr=torch.cat(DEQResult,dim=1)
         return self.decoder(curr)
 
     def configure_optimizers(self):
-        optimizer=optim.AdamW(self.parameters(), lr=self.lr)
+        optimizer=optim.AdamW(self.parameters(), lr=self.hparams['lr'])
         return {
                 "optimizer": optimizer,
                 "lr_scheduler": {
-                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=100,eta_min=1e-6),
+                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=self.hparams['tmax'],eta_min=1e-6),
                     "monitor": "train_loss",
                     "frequency": 1,
                     "interval": "epoch"
@@ -313,12 +346,10 @@ class CoilwithDEQ(CoilwithDEQBase):
 
 
 class DEQDataset(Dataset):
-    def __init__(self,XPath,yPath,index_col=None) -> None:
+    def __init__(self,XPath,yPath) -> None:
         super().__init__()
-        print(XPath)
-        print(yPath)
-        self.X=pd.read_csv(XPath,index_col=index_col)
-        self.y=pd.read_csv(yPath,index_col=index_col)
+        self.X=pd.read_csv(XPath,index_col=0)
+        self.y=pd.read_csv(yPath,index_col=0)
     def __len__(self) -> int:
         return len(self.X)
 
