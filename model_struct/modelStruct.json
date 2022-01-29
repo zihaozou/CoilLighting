@@ -1,53 +1,35 @@
 {
-    "encoder":[{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"skip",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"skip",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"fc",
-                "acti":"relu",
-                "numNeurons":256
-            },{
-                "type":"skip",
-                "acti":"relu",
-                "numNeurons":256
-            }
+    "encoder":[
     ],
-
     "DEQ":[{
             "numNeurons":256,
-            "numLayers":3,
+            "numLayers":6,
             "skipStride":2,
-            "addz":false,
+            "addx":5,
             "acti":"relu",
             "lastActi":"relu"
         }
     ],
     "decoder":{
-        "sigmoid":false
+        "extraLayers":[
+            {
+                "type":"fc",
+                "acti":"relu",
+                "numNeurons":256
+            },{
+                "type":"fc",
+                "acti":"relu",
+                "numNeurons":256
+            },{
+                "type":"skip",
+                "acti":"relu",
+                "numNeurons":256
+            },{
+                "type":"fc",
+                "acti":"relu",
+                "numNeurons":256
+            }
+        ],
+        "sigmoidOutput":true
     }
 }

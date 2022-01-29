@@ -3,7 +3,7 @@ import pytorch_lightning as pl
 import torch.nn as nn
 import torch.autograd as autograd
 import torch.functional
-from math import pi
+from math import pi,log
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
@@ -17,8 +17,8 @@ import json
 from DataFidelities.pytorch_radon.radon import Radon,IRadon
 from DataFidelities.pytorch_radon.filters import HannFilter
 from math import sqrt
-
-
+from skimage.metrics import peak_signal_noise_ratio
+from random import gauss
 class LinearBlock(nn.Module):
     def __init__(self,numInput,numOutput,batchNorm,acti):
         super(LinearBlock,self).__init__()
@@ -52,17 +52,21 @@ class FFM(nn.Module):
         if mode=='linear':
             stepTensor+=1
             for i in range(numInput):
-                ffm[index+i]=torch.sin(.5*stepTensor[index]*pi)
-                ffm[index+numInput+i]=torch.cos(.5*stepTensor[index]*pi)
+                ffm[index+i]=.5*stepTensor[index]*pi
+                ffm[index+numInput+i]=.5*stepTensor[index]*pi
         elif mode=='loglinear':
             for i in range(numInput):
-                ffm[index+i]=torch.sin(2**stepTensor[index]*pi)
-                ffm[index+numInput+i]=torch.cos(2**stepTensor[index]*pi)
+                ffm[index+i]=2**stepTensor[index]*pi
+                ffm[index+numInput+i]=2**stepTensor[index]*pi
         ffm=ffm.unsqueeze(0)
         self.register_buffer('ffmModule',ffm)
     def forward(self,x):
         repeatX=x.repeat(1,self.L*2)
         repeatX=repeatX*self.ffmModule
+        repeatX[:,::4]=torch.sin(repeatX[:,::4])
+        repeatX[:,1::4]=torch.sin(repeatX[:,1::4])
+        repeatX[:,2::4]=torch.cos(repeatX[:,2::4])
+        repeatX[:,3::4]=torch.cos(repeatX[:,3::4])
         return repeatX
 
 def anderson(f, x0, m=5, lam=1e-4, max_iter=50, tol=1e-2, beta = 1.0):
@@ -151,12 +155,14 @@ class DEQFixedPoint(nn.Module):
         self.f = f
         self.solver = solver
         self.kwargs = kwargs
+        self.lastz=None
     def forward(self, x,skip,deq):
         # compute forward pass and re-engage autograd tape
         if deq:
             with torch.no_grad():
-                z, self.forward_res = self.solver(lambda z : self.f(z, x,skip,deq), torch.zeros_like(x), **self.kwargs)
+                z, self.forward_res = self.solver(lambda z : self.f(z, x,skip,deq), self.lastz if self.lastz is not None else torch.zeros_like(x), **self.kwargs)
             newz = self.f(z.requires_grad_(),x,skip,deq)
+            self.lastz=newz.clone().detach()
             if self.training:
                 def backward_hook(grad):
                     if self.hook is not None:
@@ -167,6 +173,7 @@ class DEQFixedPoint(nn.Module):
                     return g
                 self.hook=newz.register_hook(backward_hook)
         else:
+            self.lastz=None
             newz=self.f(None, x,skip,deq)
         return newz
     
@@ -180,7 +187,6 @@ class CoilwithDEQBase(pl.LightningModule):
                 batch_size=65250,
                 L=10,
                 numInput=2,
-                showEvery=20,
                 XPath='data/X.csv',
                 yPath='data/y.csv',
                 originImagePath='data/image.csv',
@@ -194,7 +200,7 @@ class CoilwithDEQBase(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.ffm=FFM('loglinear',L,numInput)
-        self.mse=nn.MSELoss()
+        self.lossFunc=nn.MSELoss()
         self.DEQFixPointLayers=None
         self.deq=True
         self.valy=torch.from_numpy(pd.read_csv(fullyPath,index_col=0)['0'].to_numpy()).float().unsqueeze(1)
@@ -208,9 +214,140 @@ class CoilwithDEQBase(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         X,y=batch
         pred=self(X)
-        loss=self.mse(pred,y)
+        loss=self.lossFunc(pred,y)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return loss
+    
+
+    def compare_snr(self,img_test, img_true):
+        return 20 * torch.log10(torch.norm(img_true.flatten()) / torch.norm(img_true.flatten() - img_test.flatten()))
+        
+
+
+
+class CoilwithDEQ(CoilwithDEQBase):
+    def __init__(self,
+                modelStruct:dict,
+                **kwargs):
+        super().__init__(**kwargs)
+        print (json.dumps(modelStruct, indent=2, default=str))
+        numLastOutput=numSkipInput=self.hparams['numInput']*2*self.hparams['L']+self.hparams['numInput']
+        self.xEncoder=[]
+        self.xEncoderList=[]
+        for l in modelStruct['encoder']:
+            self.xEncoderList.append(l['type'])
+            if l['type']=='fc':
+                self.xEncoder.append(LinearBlock(numInput=numLastOutput,numOutput=l['numNeurons'],
+                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                    acti=l['acti']
+                                    ))
+            else:
+                self.xEncoder.append(LinearBlock(numInput=numLastOutput+numSkipInput,numOutput=l['numNeurons'],
+                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                    acti=l['acti']
+                                    ))
+            numLastOutput=l['numNeurons']
+        self.xEncoder=nn.ModuleList(self.xEncoder)
+        if 'DEQ' in modelStruct.keys():
+            self.DEQFixPointLayers=[DEQFixedPoint(DEQ(l['addx'],
+                                                    numSkipInput,
+                                                    numInput= numLastOutput,
+                                                    numEncodeNeurons= l['numNeurons'],
+                                                    numExpandLayers= l['numLayers'],
+                                                    skipStride= l['skipStride'],
+                                                    norm= self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                                    acti=l['acti'],
+                                                    lastActi=l['lastActi']),
+                                                anderson,
+                                                tol=1e-4, 
+                                                max_iter=50, 
+                                                m=5) for l in modelStruct['DEQ']]
+            self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
+            numLastOutput=numLastOutput*len(modelStruct['DEQ'])
+        self.xDecoder=[]
+        self.xDecoderList=[]
+        if 'extraLayers' in modelStruct['decoder'].keys():
+            for l in modelStruct['decoder']['extraLayers']:
+                self.xDecoderList.append(l['type'])
+                if l['type']=='fc':
+                    self.xDecoder.append(LinearBlock(numInput=numLastOutput,numOutput=l['numNeurons'],
+                                        batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                        acti=l['acti']
+                                        ))
+                else:
+                    self.xDecoder.append(LinearBlock(numInput=numLastOutput+numSkipInput,numOutput=l['numNeurons'],
+                                        batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
+                                        acti=l['acti']
+                                        ))
+                numLastOutput=l['numNeurons']
+        self.xDecoder.extend([LinearBlock(numLastOutput,numLastOutput//2,
+                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
+                                    LinearBlock(numLastOutput//2,numLastOutput//2**2,
+                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
+                                    nn.Linear(numLastOutput//2**2,1)])
+        if modelStruct['decoder']['sigmoidOutput']:
+            self.xDecoder.append(nn.Sigmoid())
+        self.xDecoder=nn.ModuleList(self.xDecoder)
+    def forward(self,x):
+        curr=torch.cat((self.ffm(x),x),dim=1)
+        skip=curr.clone().detach()
+        for layerName,layer in zip(self.xEncoderList,self.xEncoder):
+            if layerName=='fc':
+                curr=layer(curr)
+            elif layerName=='skip':
+                curr=layer(torch.cat((curr,skip),dim=1))
+        if self.DEQFixPointLayers is not None:
+            DEQResult=[deq(curr,skip,self.deq) for deq in self.DEQFixPointLayers]
+            curr=torch.cat(DEQResult,dim=1)
+        for layerName,layer in zip(self.xDecoderList,self.xDecoder[0:len(self.xDecoderList)]):
+            if layerName=='fc':
+                curr=layer(curr)
+            elif layerName=='skip':
+                curr=layer(torch.cat((curr,skip),dim=1))
+        for l in self.xDecoder[len(self.xDecoderList):]:
+            curr=l(curr)
+        return curr
+
+    def configure_optimizers(self):
+        optimizer=optim.AdamW(self.parameters(), lr=self.hparams['lr'])
+        return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=self.hparams['tmax'],eta_min=1e-6),
+                    "monitor": "train_loss",
+                    "frequency": 1,
+                    "interval": "epoch"
+                    }
+                }
+    def validation_step(self,batch,batch_idx):
+        X,_=batch
+        pred=self(X)
+        return pred.detach().clone().cpu()
+    def validation_epoch_end(self,validation_step_outputs):
+        #print(f'Validating...\nSize of noisy y label:{self.valy.shape}\nSize of origin y label:{self.originy.shape}\nSize of origin image tensor:{self.originImage.shape}')
+        valSino=torch.cat(validation_step_outputs,dim=0)
+        if self.hparams['normalized']:
+            valSino=valSino*sqrt(2*512**2)
+        #print(f'Size of output sinogram:{valSino.shape}')
+        snr=self.compare_snr(valSino,self.valy)
+        self.logger.experiment.add_scalar('noisy snr',snr,self.current_epoch)
+        originSNR=self.compare_snr(valSino,self.originy)
+        self.logger.experiment.add_scalar('origin snr',originSNR,self.current_epoch)
+        reconImage=self.fp(valSino.reshape((1,1,-1,360))).detach().squeeze()
+        #print(f'Size of recon image:{reconImage.shape}')
+        imageSNR=self.compare_snr(reconImage,self.originImage)
+        self.logger.experiment.add_scalar('Imagesnr',imageSNR,self.current_epoch)
+        self.logger.experiment.add_images('image',torch.cat((reconImage.unsqueeze(0),self.originImage.unsqueeze(0)),dim=0).unsqueeze(1).expand(-1,3,-1,-1),self.current_epoch)
+        if self.deq==True and self.DEQFixPointLayers is not None:
+            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.current_epoch)
+    def train_dataloader(self):
+        trainLoader=DataLoader(DEQDataset(self.hparams['XPath'],self.hparams['yPath']),
+                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=True)
+        return trainLoader
+    def val_dataloader(self):
+        valLoader=DataLoader(DEQDataset(self.hparams['fullXPath'],self.hparams['fullyPath']),
+                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=False)
+        return valLoader
     def getBackwardResPlot(self,dpi=75):
         fig, axs = plt.subplots(len(self.DEQFixPointLayers), 1,figsize=(10, 6), dpi=dpi)
         if len(self.DEQFixPointLayers)==1:
@@ -234,114 +371,20 @@ class CoilwithDEQBase(pl.LightningModule):
         img = cv2.imdecode(img_arr, 1)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return np.transpose(img,(2,0,1))
-    def training_epoch_end(self, outputs) -> None:
-        if self.current_epoch%self.hparams['showEvery']==0 and self.deq==True:
-            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.current_epoch)
+
+class pictureCoilwithDEQ(CoilwithDEQ):
     def validation_step(self,batch,batch_idx):
         X,_=batch
         pred=self(X)
-        return pred.detach().clone().cpu()
-    def validation_epoch_end(self,validation_step_outputs):
-        #print(f'Validating...\nSize of noisy y label:{self.valy.shape}\nSize of origin y label:{self.originy.shape}\nSize of origin image tensor:{self.originImage.shape}')
-        valSino=torch.cat(validation_step_outputs,dim=0)
-        if self.hparams['normalized']:
-            valSino=valSino*sqrt(2*512**2)
-        #print(f'Size of output sinogram:{valSino.shape}')
-        snr=self.compare_snr(valSino,self.valy)
-        self.logger.experiment.add_scalar('noisy snr',snr,self.current_epoch)
-        originSNR=self.compare_snr(valSino,self.originy)
-        self.logger.experiment.add_scalar('origin snr',originSNR,self.current_epoch)
-        reconImage=self.fp(valSino.reshape((1,1,-1,360))).detach().squeeze()
-        #print(f'Size of recon image:{reconImage.shape}')
-        imageSNR=self.compare_snr(reconImage,self.originImage)
-        self.logger.experiment.add_scalar('Imagesnr',imageSNR,self.current_epoch)
-        self.logger.experiment.add_images('image',torch.cat((reconImage.unsqueeze(0),self.originImage.unsqueeze(0)),dim=0).unsqueeze(1).expand(-1,3,-1,-1),self.current_epoch)
-    def train_dataloader(self):
-        trainLoader=DataLoader(DEQDataset(self.hparams['XPath'],self.hparams['yPath']),
-                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=True)
-        return trainLoader
-    def val_dataloader(self):
-        valLoader=DataLoader(DEQDataset(self.hparams['fullXPath'],self.hparams['fullyPath']),
-                                num_workers=8,pin_memory=True,batch_size=self.hparams['batch_size'],shuffle=False)
-        return valLoader
-    def compare_snr(self,img_test, img_true):
-        return 20 * torch.log10(torch.norm(img_true.flatten()) / torch.norm(img_true.flatten() - img_test.flatten()))
-        
-
-
-
-class CoilwithDEQ(CoilwithDEQBase):
-    def __init__(self,
-                modelStruct:dict,
-                **kwargs):
-        super().__init__(**kwargs)
-        print (json.dumps(modelStruct, indent=2, default=str))
-        numLastOutput=numSkipInput=self.hparams['numInput']*2*self.hparams['L']
-        self.xEncoder=[]
-        self.xEncoderList=[]
-        for l in modelStruct['encoder']:
-            self.xEncoderList.append(l['type'])
-            if l['type']=='fc':
-                self.xEncoder.append(LinearBlock(numInput=numLastOutput,numOutput=l['numNeurons'],
-                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
-                                    acti=l['acti']
-                                    ))
-            else:
-                self.xEncoder.append(LinearBlock(numInput=numLastOutput+numSkipInput,numOutput=l['numNeurons'],
-                                    batchNorm=self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
-                                    acti=l['acti']
-                                    ))
-            numLastOutput=l['numNeurons']
-        self.xEncoder=nn.ModuleList(self.xEncoder)
-        if 'DEQ' in modelStruct.keys():
-            self.DEQFixPointLayers=[DEQFixedPoint(DEQ(numSkipInput,
-                                                    numInput= numLastOutput,
-                                                    numEncodeNeurons= l['numNeurons'],
-                                                    numExpandLayers= l['numLayers'],
-                                                    skipStride= l['skipStride'],
-                                                    addz=l['addz'],
-                                                    norm= self.hparams['norm'] if 'norm' in self.hparams.keys() else False,
-                                                    acti=l['acti'],
-                                                    lastActi=l['lastActi']),
-                                                anderson,
-                                                tol=1e-4, 
-                                                max_iter=50, 
-                                                m=5) for l in modelStruct['DEQ']]
-            self.DEQFixPointLayers=nn.ModuleList(self.DEQFixPointLayers)
-            numLastOutput=numLastOutput*len(modelStruct['DEQ'])
-        self.decoder=[LinearBlock(numLastOutput,numLastOutput//2,
-                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
-                                    LinearBlock(numLastOutput//2,numLastOutput//2**2,
-                                    self.hparams['norm'] if 'norm' in self.hparams.keys() else False,acti='relu'),
-                                    nn.Linear(numLastOutput//2**2,1)]
-        if modelStruct['decoder']['sigmoid']:
-            self.decoder.append(nn.Sigmoid())
-        self.decoder=nn.Sequential(*self.decoder)
-    def forward(self,x):
-        curr=self.ffm(x)
-        skip=curr.clone().detach()
-        for layerName,layer in zip(self.xEncoderList,self.xEncoder):
-            if layerName=='fc':
-                curr=layer(curr)
-            elif layerName=='skip':
-                curr=layer(torch.cat((curr,skip),dim=1))
-        if self.DEQFixPointLayers is not None:
-            DEQResult=[deq(curr,skip,self.deq) for deq in self.DEQFixPointLayers]
-            curr=torch.cat(DEQResult,dim=1)
-        return self.decoder(curr)
-
-    def configure_optimizers(self):
-        optimizer=optim.AdamW(self.parameters(), lr=self.hparams['lr'])
-        return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": CosineAnnealingLR(optimizer=optimizer,T_max=self.hparams['tmax'],eta_min=1e-6),
-                    "monitor": "train_loss",
-                    "frequency": 1,
-                    "interval": "epoch"
-                    }
-                }
-
+        pred=pred.detach().cpu().reshape((1,1,256,256))
+        self.logger.experiment.add_images('Image',torch.cat((pred,self.originImage.reshape(1,1,256,256)),dim=0).expand(2,3,256,256),self.current_epoch)
+        psnr=peak_signal_noise_ratio(pred.numpy(),self.originImage.reshape(1,1,256,256).numpy())
+        self.logger.experiment.add_scalar('psnr',psnr,self.current_epoch)
+        return
+    def validation_epoch_end(self, validation_step_outputs):
+        if self.deq==True and self.DEQFixPointLayers is not None:
+            self.logger.experiment.add_image("residual", self.getBackwardResPlot(), self.current_epoch)
+        return
 
 
 

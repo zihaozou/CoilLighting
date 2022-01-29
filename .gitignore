@@ -11,3 +11,4 @@ lightning_logs/
 Dry_Bean_Dataset.xlsx
 bank-full.csv
 bank-additional-full.csv
+experiment/

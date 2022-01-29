@@ -1,38 +1,40 @@
-# %%
+
 import torch
 import pytorch_lightning as pl
-from DEQLighting import DEQDataset,CoilwithDEQ,LinearBlock
+from DEQLighting import DEQDataset,CoilwithDEQ,LinearBlock,pictureCoilwithDEQ
 import torch.nn as nn
 import json
-
-# %%
-numEpoch=800
-
-# %%
-with open('modelStruct.json') as jFile:
-    unnormalizedModelStruct=json.load(jFile)
-with open('model_normalized.json') as jFile:
-    normalizedModelStruct=json.load(jFile)
+from tkinter import filedialog as fd
 
 
-# %%
-deq=CoilwithDEQ(unnormalizedModelStruct,
+numEpoch=3000
+
+
+filename = fd.askopenfilename()
+with open(filename) as jfile:
+    ModelStruct=json.load(jfile)
+
+
+deq=pictureCoilwithDEQ(ModelStruct,
                 lr=.1,
                 numInput=2,
-                numEncodeNeurons=256,
-                addz=False,
-                showEvery=1,
                 L=20,
                 norm=True,
-                tmax=numEpoch)
+                tmax=numEpoch,
+                batch_size=65536,
+                XPath='data/imageX.csv',
+                yPath='data/imagey.csv',
+                fullXPath='data/imageX.csv',
+                fullyPath='data/imagey.csv',
+                originImagePath='data/01image.csv',)
 
-# %%
-trainer=pl.Trainer(gpus=1,log_every_n_steps=1,max_epochs=numEpoch,default_root_dir='experiment',check_val_every_n_epoch=20,num_sanity_val_steps=0)
 
-# %%
+trainer=pl.Trainer(gpus=1,log_every_n_steps=1,max_epochs=numEpoch,default_root_dir='experiment',check_val_every_n_epoch=5,num_sanity_val_steps=0)
+
+
 trainer.fit(deq)
 
-# %%
-trainer.save_checkpoint('experiment/9layers_unnormalized.ckpt')
+
+trainer.save_checkpoint('experiment/PictureWithDEQ.ckpt')
 
 
