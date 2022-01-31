@@ -30,6 +30,6 @@
                 "numNeurons":256
             }
         ],
-        "sigmoidOutput":true
+        "sigmoidOutput":false
     }
 }
