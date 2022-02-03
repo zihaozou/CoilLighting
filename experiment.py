@@ -9,7 +9,7 @@ jsonWithDEQ='model_struct/coilwithDEQ.json'
 numEpoch=6000
 
 
-with open(jsonWithDEQ) as jfile:
+with open(jsonWithoutDEQ) as jfile:
     ModelStruct=json.load(jfile)
 
 
@@ -22,5 +22,5 @@ trainer=pl.Trainer(gpus=1,log_every_n_steps=1,max_epochs=numEpoch,default_root_d
 trainer.fit(deq)
 
 
-trainer.save_checkpoint('experiment/Coil/CoilWithDEQ.ckpt')
+trainer.save_checkpoint('experiment/Coil/CoilWithoutDEQ_3.ckpt')
 

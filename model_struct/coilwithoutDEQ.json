@@ -48,7 +48,7 @@
                 "acti":"relu",
                 "numNeurons":256
             },{
-                "type":"skip",
+                "type":"fc",
                 "acti":"relu",
                 "numNeurons":256
             },{
